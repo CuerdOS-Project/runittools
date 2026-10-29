@@ -1,4 +1,4 @@
-# runitctl y runit-journal
+# runitctl y runit-journal (versión 1.0)
 
 Este paquete contiene dos ejecutables con responsabilidades separadas. `runitctl` administra servicios y ofrece el comando clásico `runitctl log SERVICIO`. `runit-journal` es una TUI autónoma basada en `tcell`, especializada en buscar servicios, leer su logging y seguir nuevas líneas; no delega la pantalla en `runitctl`.
 
@@ -45,6 +45,40 @@ Para una sesión que además se guarde en un archivo del usuario, `-g` conserva 
 ```sh
 runit-journal nginx -f -g --log-dir "$HOME/logs/runit"
 ```
+
+## Más herramientas de runit
+
+- Órdenes extra de `sv`: `once`, `term`, `kill`, `int`, `alarm`, `usr1`, `usr2`, `quit` y `check` (`runitctl term nginx`).
+- `runitctl runlevel` muestra los niveles de arranque; `sudo runitctl runlevel single` cambia de nivel con `runsvchdir`.
+- `runitctl doctor` revisa que existan `sv`, `runsv`, `runsvdir`, `runsvchdir`, `svlogd`, `chpst`, `utmpset`, `svlogtail` y `socklog`.
+- La versión se ve con `-v`, `-V` o `--version`.
+
+## Dependencias de logs en Void Linux
+
+`svlogd` ya viene con runit. Para los logs de sistema (syslog) hace falta `socklog-void` (incluye `svlogtail`) y los servicios `socklog-unix` y `nanoklogd`. Un solo comando lo instala si falta, habilita los servicios y añade al usuario que invocó `sudo`/`doas` al grupo `socklog` para leer sin root (requiere volver a iniciar sesión). Es idempotente:
+
+```sh
+sudo runitctl setup-logs      # o: sudo make setup-logs
+```
+
+## Elevación de privilegios, TUI y `logs`
+
+- Si una acción necesita root y estás en una terminal, `runitctl` pregunta «¿Reiniciar el comando con sudo? [S/n]» y se relanza con `sudo` (o `doas`). Sin terminal (scripts, cron) solo muestra el error.
+- La TUI muestra el estado con color: verde `●` activo, rojo `○`/`✖` detenido o con fallo, amarillo `‖` pausado y `⊘` enmascarado, gris `○` deshabilitado.
+- `logs`: `-n` indica cuántas líneas de historial mostrar y, con `-f`, se sigue desde ahí. `-i` no se combina con `-g`, `--log-dir` ni `-n`, y `--log-dir` exige `-g` (código de salida 2). Si no hay logging configurado en Void, se sugiere `sudo runitctl setup-logs`.
+
+## Configuración por entorno
+
+| Variable | Efecto | Por defecto |
+| --- | --- | --- |
+| `RUNITCTL_SV_DIR` | Directorio con las definiciones de servicio | `/etc/sv` |
+| `RUNITCTL_SVDIR` | Directorio supervisado por `runsvdir` (se pasa a `sv` como `SVDIR`); si no existe se usa `$SVDIR` | `/etc/runit/runsvdir/default` |
+| `RUNITCTL_SOCKLOG_DIR` | Directorio de socklog | `/var/log/socklog` |
+| `RUNITCTL_LANG` | Idioma (`es`, `en`, `pt`, `ca`) | detectado de `LC_ALL`/`LC_MESSAGES`/`LANG`; inglés si no coincide |
+| `RUNITCTL_NO_ELEVATE` / `RUNITCTL_AUTO_ELEVATE` | `1` desactiva la oferta de `sudo`/`doas`; `1` eleva sin preguntar | pregunta en terminales |
+| `NO_COLOR` | Desactiva los colores ANSI (también se desactivan si la salida no es una terminal) | — |
+
+`runitctl --version` y `runit-journal -version` muestran la versión inyectada en la compilación. Las llamadas a `sv` tienen un tiempo máximo de 10 s para que un `runsv` colgado no bloquee la CLI ni la TUI.
 
 ## Compilación e instalación
 

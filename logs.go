@@ -3,11 +3,9 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -17,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+
+	"runitctl/internal/runitlog"
 )
 
 // ---------------------------------------------------------------------
@@ -60,8 +60,9 @@ const (
 	logSourceJournalctl
 )
 
-// SocklogDir es la ubicación estándar de socklog-void.
-const SocklogDir = "/var/log/socklog"
+// SocklogDir es la ubicación estándar de socklog-void (RUNITCTL_SOCKLOG_DIR
+// permite cambiarla).
+var SocklogDir = envOr("RUNITCTL_SOCKLOG_DIR", "/var/log/socklog")
 
 type logSource struct {
 	kind         logSourceKind
@@ -176,11 +177,11 @@ func resolveLogSource(service string) (*logSource, []string) {
 		files := socklogCandidateFiles()
 		if len(files) > 0 {
 			tried = append(tried, SocklogDir+" (socklog, escaneo manual: "+strings.Join(files, ", ")+")")
-			return &logSource{kind: logSourceSocklog, backend: "socklog (archivos current)", tag: service, socklogFiles: files}, tried
+			return &logSource{kind: logSourceSocklog, backend: "registro del sistema (socklog)", tag: service, socklogFiles: files}, tried
 		}
 		if _, err := exec.LookPath("svlogtail"); err == nil {
 			tried = append(tried, "svlogtail | grep "+service+" (socklog)")
-			return &logSource{kind: logSourceSvlogtail, backend: "socklog (svlogtail)", tag: service}, tried
+			return &logSource{kind: logSourceSvlogtail, backend: "registro del sistema (socklog)", tag: service}, tried
 		}
 		tried = append(tried, SocklogDir+" (existe pero sin clases con 'current')")
 	}
@@ -210,6 +211,11 @@ func buildNoLogSourceMessage(service string, tried []string) string {
 		fmt.Fprintln(&b)
 		fmt.Fprintln(&b, T("logs_hint_logdir_empty", strings.Join(logDirs, ", "), service))
 	}
+	// En Void sin socklog instalado/habilitado, la solución es un comando.
+	if isVoid() && !exists(SocklogDir) {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(&b, T("logs_hint_setup"))
+	}
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, T("logs_tried_paths"))
 	for _, p := range tried {
@@ -218,123 +224,19 @@ func buildNoLogSourceMessage(service string, tried []string) string {
 	return b.String()
 }
 
-// ---------------------------------------------------------------------
-// Decodificación de timestamps TAI64N
-// ---------------------------------------------------------------------
-//
-// svlogd (con -t/-tt) y multilog anteponen a cada línea una marca TAI64N:
-// '@' seguido de 24 dígitos hexadecimales (segundos TAI64) y, en la
-// variante TAI64N, 8 dígitos hexadecimales más de nanosegundos.
-
-const tai64Offset = int64(0x400000000000000a)
-
-func decodeTai64n(line string) string {
-	if len(line) < 25 || line[0] != '@' {
-		return line
-	}
-	secHex := line[1:17]
-	rest := line[17:]
-	nsHex := ""
-	if len(rest) >= 8 {
-		maybeNs := rest[:8]
-		if isHex(maybeNs) {
-			nsHex = maybeNs
-			rest = rest[8:]
-		}
-	}
-	if !isHex(secHex) {
-		return line
-	}
-	secRaw, err := strconv.ParseInt(secHex, 16, 64)
-	if err != nil {
-		return line
-	}
-	var ns int64
-	if nsHex != "" {
-		ns, _ = strconv.ParseInt(nsHex, 16, 64)
-	}
-	unixSec := secRaw - tai64Offset
-	t := time.Unix(unixSec, ns).UTC()
-	rest = strings.TrimPrefix(rest, " ")
-	return t.Format("2006-01-02 15:04:05.000000") + "  " + rest
-}
-
-func isHex(s string) bool {
-	for _, r := range s {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return false
-		}
-	}
-	return len(s) > 0
-}
-
-func formatLogLine(raw string, decode bool) string {
-	if decode {
-		return decodeTai64n(raw)
-	}
-	return raw
-}
-
-// ---------------------------------------------------------------------
-// Lectura de las últimas N líneas
-// ---------------------------------------------------------------------
-
-// readTailLines lee hasta 'n' líneas finales de un archivo, sin cargar
-// archivos enormes completos en memoria: retrocede en bloques desde el
-// final hasta acumular suficientes saltos de línea (o llegar al inicio).
-func readTailLines(path string, n int) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	size := info.Size()
-
-	const blockSize = int64(64 * 1024)
-	const maxScan = int64(8 * 1024 * 1024) // tope de 8MB para no leer logs gigantes enteros
-
-	var data []byte
-	pos := size
-	newlines := 0
-	for pos > 0 && newlines <= n && (size-pos) < maxScan {
-		readSize := blockSize
-		if readSize > pos {
-			readSize = pos
-		}
-		pos -= readSize
-		buf := make([]byte, readSize)
-		if _, err := f.ReadAt(buf, pos); err != nil && err != io.EOF {
-			return nil, err
-		}
-		newlines += strings.Count(string(buf), "\n")
-		data = append(buf, data...)
-	}
-
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(lines) == 1 && lines[0] == "" {
-		return []string{}, nil
-	}
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return lines, nil
-}
+// La decodificación TAI64N y la lectura de las últimas líneas viven en
+// internal/runitlog (compartidas con runit-journal).
 
 func readInitialLines(src *logSource, n int) ([]string, error) {
 	switch src.kind {
 	case logSourceFile:
-		raw, err := readTailLines(src.path, n)
+		raw, err := runitlog.ReadTailLines(src.path, n)
 		if err != nil {
 			return nil, err
 		}
 		out := make([]string, len(raw))
 		for i, l := range raw {
-			out[i] = formatLogLine(l, src.decode)
+			out[i] = runitlog.FormatLine(l, src.decode)
 		}
 		return out, nil
 	case logSourceSocklog:
@@ -352,7 +254,7 @@ func readInitialLines(src *logSource, n int) ([]string, error) {
 		}
 		return strings.Split(text, "\n"), nil
 	}
-	return nil, fmt.Errorf("backend de logs desconocido")
+	return nil, fmt.Errorf("No sé de dónde leer los registros")
 }
 
 // readSocklogInitialLines lee las últimas líneas de cada archivo de clase
@@ -374,7 +276,7 @@ func readSocklogInitialLines(src *logSource, n int) ([]string, error) {
 	var matched []string
 	var readErr error
 	for _, path := range src.socklogFiles {
-		raw, err := readTailLines(path, perFile)
+		raw, err := runitlog.ReadTailLines(path, perFile)
 		if err != nil {
 			readErr = err
 			continue
@@ -511,42 +413,28 @@ func tailLive(src *logSource, out chan<- string, stop <-chan struct{}) {
 	}
 }
 
-// tailFileLive sigue un único archivo desde su final, opcionalmente
-// filtrando cada línea con 'filter' (nil = sin filtro) antes de decodificar
-// y enviarla por 'out'. Se usa tanto para el caso simple (un archivo por
-// servicio) como, con filtro, para cada clase de socklog.
+// send entrega una línea por 'out' sin bloquearse para siempre si el
+// consumidor ya se fue: devuelve false cuando 'stop' se cerró.
+func send(out chan<- string, stop <-chan struct{}, line string) bool {
+	select {
+	case out <- line:
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+// tailFileLive sigue un archivo desde su final (con soporte de rotación de
+// svlogd, truncado y líneas parciales; ver runitlog.FollowFile),
+// opcionalmente filtrando cada línea con 'filter' (nil = sin filtro) antes
+// de decodificarla y enviarla por 'out'. Se usa tanto para el caso simple
+// (un archivo por servicio) como, con filtro, para cada clase de socklog.
 func tailFileLive(path string, decode bool, filter func(string) bool, out chan<- string, stop <-chan struct{}) {
-	f, err := os.Open(path)
-	if err != nil {
-		out <- fmt.Sprintf("[runitctl] no se pudo abrir %s: %v", path, err)
-		return
-	}
-	defer f.Close()
-	if info, err := f.Stat(); err == nil {
-		f.Seek(info.Size(), io.SeekStart)
-	}
-	reader := bufio.NewReader(f)
-	ticker := time.NewTicker(400 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			for {
-				line, err := reader.ReadString('\n')
-				if line != "" {
-					trimmed := strings.TrimRight(line, "\n")
-					if filter == nil || filter(trimmed) {
-						out <- formatLogLine(trimmed, decode)
-					}
-				}
-				if err != nil {
-					break
-				}
-			}
+	runitlog.FollowFile(path, 400*time.Millisecond, stop, func(line string) {
+		if filter == nil || filter(line) {
+			send(out, stop, runitlog.FormatLine(line, decode))
 		}
-	}
+	})
 }
 
 // tailSocklogLive sigue en paralelo todos los archivos de clase relevantes
@@ -582,13 +470,13 @@ func tailSvlogtailLive(src *logSource, out chan<- string, stop <-chan struct{}) 
 	cmd := exec.Command("svlogtail", "-f")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		out <- fmt.Sprintf("[runitctl] no se pudo abrir el pipe de 'svlogtail': %v", err)
+		send(out, stop, fmt.Sprintf("[runitctl] No se pudo leer la salida de svlogtail: %v", err))
 		return
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		out <- fmt.Sprintf("[runitctl] no se pudo iniciar 'svlogtail': %v", err)
+		send(out, stop, fmt.Sprintf("[runitctl] No se pudo iniciar svlogtail: %v", err))
 		return
 	}
 	go func() {
@@ -596,12 +484,13 @@ func tailSvlogtailLive(src *logSource, out chan<- string, stop <-chan struct{}) 
 		_ = cmd.Process.Kill()
 	}()
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	rawSeen := 0
 	for scanner.Scan() {
 		rawSeen++
 		line := scanner.Text()
 		if tagRe.MatchString(line) {
-			out <- line
+			send(out, stop, line)
 		}
 	}
 	_ = cmd.Wait()
@@ -615,9 +504,9 @@ func tailSvlogtailLive(src *logSource, out chan<- string, stop <-chan struct{}) 
 	if !killed && rawSeen == 0 {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
-			msg = "'svlogtail' terminó sin producir salida. Verifica que socklog-void esté instalado y que el usuario tenga permisos sobre /var/log/socklog."
+			msg = "svlogtail no mostró nada. Revisa que socklog esté instalado (sudo runitctl setup-logs) y que tengas permiso para leer los registros."
 		}
-		out <- "[runitctl] " + msg
+		send(out, stop, "[runitctl] "+msg)
 	}
 }
 
@@ -629,13 +518,13 @@ func tailJournalctlLive(src *logSource, out chan<- string, stop <-chan struct{})
 	cmd := exec.Command("journalctl", "-t", src.tagArg(), "-n", "0", "-f", "--no-pager", "-o", "short-iso")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		out <- fmt.Sprintf("[runitctl] no se pudo abrir el pipe de 'journalctl': %v", err)
+		send(out, stop, fmt.Sprintf("[runitctl] No se pudo leer la salida de journalctl: %v", err))
 		return
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		out <- fmt.Sprintf("[runitctl] no se pudo iniciar 'journalctl': %v", err)
+		send(out, stop, fmt.Sprintf("[runitctl] No se pudo iniciar journalctl: %v", err))
 		return
 	}
 	go func() {
@@ -643,10 +532,11 @@ func tailJournalctlLive(src *logSource, out chan<- string, stop <-chan struct{})
 		_ = cmd.Process.Kill()
 	}()
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	rawSeen := 0
 	for scanner.Scan() {
 		rawSeen++
-		out <- scanner.Text()
+		send(out, stop, scanner.Text())
 	}
 	_ = cmd.Wait()
 
@@ -659,58 +549,15 @@ func tailJournalctlLive(src *logSource, out chan<- string, stop <-chan struct{})
 	if !killed && rawSeen == 0 {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
-			msg = "'journalctl -f' terminó sin producir salida."
+			msg = "journalctl no mostró nada."
 		}
-		out <- "[runitctl] " + msg
+		send(out, stop, "[runitctl] "+msg)
 	}
 }
 
 // ---------------------------------------------------------------------
 // Grabación local de logs
 // ---------------------------------------------------------------------
-
-// defaultUserLogDir devuelve una carpeta escribible por el usuario actual.
-// No usa /var/log porque -g está pensado para funcionar sin privilegios y no
-// debe cambiar permisos ni propiedad de los logs del sistema.
-func defaultUserLogDir() string {
-	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
-		return filepath.Join(d, "runitctl", "logs")
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".local", "state", "runitctl", "logs")
-	}
-	return filepath.Join(".", ".runitctl-logs")
-}
-
-func safeLogName(service string) string {
-	name := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
-			return r
-		}
-		return '_'
-	}, service)
-	if name == "" {
-		return "service"
-	}
-	return name
-}
-
-func openLogCapture(service, dir string) (*os.File, error) {
-	if dir == "" {
-		dir = defaultUserLogDir()
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, err
-	}
-	stamp := time.Now().Format("20060102-150405")
-	path := filepath.Join(dir, safeLogName(service)+"-"+stamp+".log")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Fprintf(f, "# runitctl capture\n# service: %s\n# started: %s\n\n", service, time.Now().Format(time.RFC3339))
-	return f, nil
-}
 
 // ---------------------------------------------------------------------
 // Comando de CLI: runitctl logs <servicio> [-n N] [-f] [-i] [-g]
@@ -729,6 +576,7 @@ func cmdLogs(service string, extra []string) {
 		os.Exit(1)
 	}
 	n := 40
+	nSet := false
 	follow := false
 	interactive := false
 	grab := false
@@ -743,27 +591,45 @@ func cmdLogs(service string, extra []string) {
 			grab = true
 		case "--log-dir":
 			if i+1 >= len(extra) || extra[i+1] == "" {
-				errorMsg("--log-dir requiere una carpeta")
+				errorMsg("Falta la carpeta después de --log-dir.")
 				os.Exit(2)
 			}
 			logDir = extra[i+1]
 			i++
 		case "-n", "--lines":
 			if i+1 >= len(extra) {
-				errorMsg("-n/--lines requiere un número")
+				errorMsg("Falta el número después de -n.")
 				os.Exit(2)
 			}
 			v, err := strconv.Atoi(extra[i+1])
 			if err != nil || v < 1 || v > 100000 {
-				errorMsg("-n/--lines debe ser un entero entre 1 y 100000")
+				errorMsg("Después de -n escribe un número entre 1 y 100000.")
 				os.Exit(2)
 			}
 			n = v
+			nSet = true
 			i++
 		default:
-			errorMsg(fmt.Sprintf("opción desconocida para logs: %s", extra[i]))
+			errorMsg(fmt.Sprintf("No conozco la opción %s.", extra[i]))
 			os.Exit(2)
 		}
+	}
+
+	// Combinaciones incoherentes: se rechazan en vez de ignorarse en silencio.
+	if interactive {
+		for _, c := range []struct {
+			used bool
+			flag string
+		}{{grab, "-g"}, {logDir != "", "--log-dir"}, {nSet, "-n"}} {
+			if c.used {
+				errorMsg(T("logs_flag_conflict", "-i", c.flag))
+				os.Exit(2)
+			}
+		}
+	}
+	if logDir != "" && !grab {
+		errorMsg(T("logs_logdir_needs_grab"))
+		os.Exit(2)
 	}
 
 	if interactive {
@@ -785,7 +651,7 @@ func cmdLogs(service string, extra []string) {
 	var capture *os.File
 	if grab {
 		var err error
-		capture, err = openLogCapture(service, logDir)
+		capture, err = runitlog.OpenCapture(service, logDir)
 		if err != nil {
 			errorMsg(T("logs_save_error", err))
 			os.Exit(1)
@@ -854,7 +720,6 @@ func capturePath(f *os.File) string {
 // el bucle principal del visor cuando llega una línea nueva en modo follow.
 type logRedrawEvent struct {
 	tcell.EventTime
-	line string
 }
 
 func logViewer(screen tcell.Screen, service string) {
@@ -867,8 +732,13 @@ func logViewer(screen tcell.Screen, service string) {
 
 	var lines []string
 	var stop chan struct{}
-	var newLines chan string
 	var reloadErr string
+
+	// Las líneas nuevas se acumulan en 'pending' (protegido por pendMu) y
+	// solo se postea un evento de "despertar". Así no se pierden líneas si la
+	// cola de eventos de tcell se llena (PostEvent no bloquea y descarta).
+	var pendMu sync.Mutex
+	var pending []string
 
 	// startSource (re)detecta el backend de logs y arranca su seguimiento en
 	// vivo. Se usa tanto en el arranque del visor como al pulsar 'r' para
@@ -888,16 +758,30 @@ func logViewer(screen tcell.Screen, service string) {
 			lines = l
 		}
 
-		stop = make(chan struct{})
-		newLines = make(chan string, 200)
-		go tailLive(src, newLines, stop)
-		go func(ch <-chan string) {
-			for line := range ch {
-				// El consumidor real de la línea ocurre en el bucle
-				// principal. El evento transporta la línea para no perderla.
-				screen.PostEvent(&logRedrawEvent{line: line})
+		pendMu.Lock()
+		pending = nil
+		pendMu.Unlock()
+
+		myStop := make(chan struct{})
+		stop = myStop
+		newLines := make(chan string, 200)
+		go func(s *logSource) {
+			tailLive(s, newLines, myStop)
+			close(newLines) // evita que el consumidor quede colgado tras recargar/salir
+		}(src)
+		go func() {
+			for line := range newLines {
+				select {
+				case <-myStop:
+					continue // fuente reemplazada: se descarta lo que llegue
+				default:
+				}
+				pendMu.Lock()
+				pending = append(pending, line)
+				pendMu.Unlock()
+				_ = screen.PostEvent(&logRedrawEvent{})
 			}
-		}(newLines)
+		}()
 	}
 	startSource()
 	defer func() {
@@ -942,7 +826,10 @@ func logViewer(screen tcell.Screen, service string) {
 
 		switch ev := screen.PollEvent().(type) {
 		case *logRedrawEvent:
-			lines = append(lines, ev.line)
+			pendMu.Lock()
+			lines = append(lines, pending...)
+			pending = pending[:0]
+			pendMu.Unlock()
 			if len(lines) > 5000 {
 				lines = lines[len(lines)-5000:]
 			}

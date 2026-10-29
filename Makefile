@@ -5,14 +5,16 @@ BIN         := runitctl
 JOURNAL_BIN := runit-journal
 GO          ?= go
 INSTALL     := install
+VERSION     ?= 1.0
+GOFLAGS_REL := -trimpath -ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all build install uninstall clean fmt vet test race check run
+.PHONY: setup-logs all build install uninstall clean fmt vet test race check run
 
 all: build
 
 build:
-	$(GO) build -o $(BIN) .
-	$(GO) build -o $(JOURNAL_BIN) ./cmd/runit-journal
+	$(GO) build $(GOFLAGS_REL) -o $(BIN) .
+	$(GO) build $(GOFLAGS_REL) -o $(JOURNAL_BIN) ./cmd/runit-journal
 
 fmt:
 	$(GO) fmt ./...
@@ -46,3 +48,7 @@ clean:
 
 run: build
 	./$(BIN) $(ARGS)
+
+# Instala socklog-void y habilita socklog-unix y nanoklogd (Void Linux, requiere root).
+setup-logs: build
+	./$(BIN) setup-logs
