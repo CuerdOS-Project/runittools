@@ -1,21 +1,48 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"runitctl/internal/runitlog"
 )
 
-// Constantes de rutas por defecto de runit
-const (
-	SvDir    = "/etc/sv"
-	RunsvDir = "/etc/runit/runsvdir/default"
+// version se sobrescribe en la compilación: -ldflags "-X main.version=1.2.3".
+var version = "1.0"
+
+// svCommandTimeout acota las consultas/acciones de 'sv' para que un runsv
+// colgado no congele la CLI ni la TUI.
+const svCommandTimeout = 10 * time.Second
+
+// Rutas de runit. Los valores por defecto sirven para Void Linux y derivadas;
+// pueden cambiarse con variables de entorno (útil en otras distribuciones y
+// para las pruebas):
+//
+//	RUNITCTL_SV_DIR  directorio con las definiciones de servicio (/etc/sv)
+//	RUNITCTL_SVDIR   directorio supervisado por runsvdir (por defecto $SVDIR
+//	                 si está definido; si no, /etc/runit/runsvdir/default)
+var (
+	SvDir    = envOr("RUNITCTL_SV_DIR", "/etc/sv")
+	RunsvDir = envOr("RUNITCTL_SVDIR", envOr("SVDIR", "/etc/runit/runsvdir/default"))
 )
 
-// Códigos ANSI para color y formato
-const (
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// Códigos ANSI para color y formato. Se vacían cuando la salida no es una
+// terminal o el usuario definió NO_COLOR (https://no-color.org), para que
+// `runitctl status x | grep ...` o las redirecciones no lleven basura.
+var (
 	ColorReset  = "\033[0m"
 	ColorRed    = "\033[31m"
 	ColorGreen  = "\033[32m"
@@ -24,22 +51,31 @@ const (
 	Bold        = "\033[1m"
 )
 
+func init() {
+	if !colorEnabled() {
+		ColorReset, ColorRed, ColorGreen, ColorYellow, ColorBlue, Bold = "", "", "", "", "", ""
+	}
+}
+
+func colorEnabled() bool {
+	if _, set := os.LookupEnv("NO_COLOR"); set {
+		return false
+	}
+	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	st, err := os.Stdout.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
 func info(msg string)     { fmt.Printf("%s%s%s\n", ColorBlue, msg, ColorReset) }
 func success(msg string)  { fmt.Printf("%s%s%s\n", ColorGreen, msg, ColorReset) }
 func warn(msg string)     { fmt.Printf("%s%s%s\n", ColorYellow, msg, ColorReset) }
 func errorMsg(msg string) { fmt.Fprintf(os.Stderr, "%s%s%s\n", ColorRed, msg, ColorReset) }
 
-func checkRoot() {
-	if os.Geteuid() != 0 {
-		errorMsg(T("root_required"))
-		fmt.Printf("%s%s%s\n", ColorGreen, T("try_again", os.Args[0], strings.Join(os.Args[1:], " ")), ColorReset)
-		os.Exit(1)
-	}
-}
-
 func requiresRoot(action string) bool {
 	switch action {
-	case "start", "stop", "restart", "reload", "pause", "cont", "enable", "disable", "mask", "unmask", "tui":
+	case "start", "stop", "restart", "reload", "pause", "cont", "enable", "disable", "mask", "unmask", "tui", "setup-logs":
 		return true
 	default:
 		return false
@@ -51,8 +87,17 @@ func exists(path string) bool {
 	return err == nil
 }
 
+// lexists es como exists pero sin seguir enlaces simbólicos: un servicio
+// habilitado cuyo destino desapareció (enlace roto) sigue "existiendo" como
+// enlace y debe poder deshabilitarse, en vez de quedar atascado entre
+// "ya deshabilitado" y "el archivo ya existe".
+func lexists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
 func printHelp() {
-	fmt.Printf("%s%s%s\n\n", Bold, T("help_title"), ColorReset)
+	fmt.Printf("%s%s%s  v%s\n\n", Bold, T("help_title"), ColorReset, version)
 	fmt.Printf("%s%s%s\n", Bold, T("help_usage"), ColorReset)
 	fmt.Println("  runitctl [--lang es|en|pt|ca] <acción> [servicio]")
 	fmt.Println()
@@ -64,6 +109,10 @@ func printHelp() {
 	fmt.Printf("  %spause%s <servicio>      - %s\n", ColorGreen, ColorReset, T("help_pause"))
 	fmt.Printf("  %scont%s <servicio>       - %s\n", ColorGreen, ColorReset, T("help_cont"))
 	fmt.Printf("  %sstatus%s <servicio>     - %s\n", ColorGreen, ColorReset, T("help_status"))
+	fmt.Println()
+	for _, a := range advancedOrder {
+		fmt.Printf("  %s%-5s%s <servicio>      - %s\n", ColorGreen, a, ColorReset, T("help_"+a))
+	}
 	fmt.Println()
 	fmt.Printf("%s%s%s\n", Bold, T("help_config_mgmt"), ColorReset)
 	fmt.Printf("  %senable%s <servicio>     - %s\n", ColorGreen, ColorReset, T("help_enable"))
@@ -78,17 +127,46 @@ func printHelp() {
 	fmt.Printf("  %slog%s <servicio> [-n N] [-f] [-i] [-g] [--log-dir DIR] - %s\n", ColorGreen, ColorReset, T("help_logs"))
 	fmt.Printf("           (alias compatible: %slogs%s)\n", ColorGreen, ColorReset)
 	fmt.Printf("           (%s)\n", T("help_logs_interactive"))
-	fmt.Printf("  %srunit-journal%s       - selector/visor de logs de servicios (incluido como segundo binario)\n", ColorGreen, ColorReset)
+	fmt.Printf("  %srunit-journal%s       - pantalla para elegir un servicio y ver sus registros (programa aparte)\n", ColorGreen, ColorReset)
+	fmt.Printf("  %srunlevel%s [nivel]     - %s\n", ColorGreen, ColorReset, T("help_runlevel"))
+	fmt.Printf("  %sdoctor%s               - %s\n", ColorGreen, ColorReset, T("help_doctor"))
+	fmt.Printf("  %s--version%s, -v, -V    - %s\n", ColorGreen, ColorReset, T("help_version"))
+	fmt.Printf("  %ssetup-logs%s           - %s\n", ColorGreen, ColorReset, T("help_setup_logs"))
 	fmt.Printf("  %stui%s                  - %s\n", ColorGreen, ColorReset, T("help_tui"))
 	os.Exit(0)
 }
 
+// svEnv apunta SVDIR de 'sv' al mismo directorio que runitctl usa para decidir
+// si un servicio está habilitado, de modo que ambos hablen del mismo árbol.
+func svEnv() []string { return append(os.Environ(), "SVDIR="+RunsvDir) }
+
+// runSvCommand ejecuta 'sv' mostrando su salida directamente (modo CLI).
 func runSvCommand(command, service string) bool {
-	cmd := exec.Command("sv", command, service)
+	ctx, cancel := context.WithTimeout(context.Background(), svCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sv", command, service)
+	cmd.Env = svEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	return cmd.Run() == nil
+}
+
+// runSvCaptured ejecuta 'sv' capturando su salida (modo TUI, donde escribir
+// directo a stdout/stderr corrompería la pantalla de tcell) y con tiempo
+// máximo. Devuelve la salida combinada y si terminó con éxito.
+func runSvCaptured(command, service string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), svCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sv", command, service)
+	cmd.Env = svEnv()
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
-	return err == nil
+	text := strings.TrimSpace(out.String())
+	if ctx.Err() == context.DeadlineExceeded {
+		text = strings.TrimSpace(text + "\nEl servicio tardó demasiado en responder.")
+	}
+	return text, err == nil
 }
 
 // parseArgs extrae un flag opcional --lang/-l (en cualquier posición) y
@@ -124,6 +202,15 @@ func main() {
 	if action == "--help" || action == "-h" || action == "help" {
 		printHelp()
 	}
+	if action == "setup-logs" {
+		checkRoot()
+		cmdSetupLogging()
+		return
+	}
+	if action == "--version" || action == "version" || action == "-v" || action == "-V" {
+		fmt.Println("runitctl " + version)
+		return
+	}
 
 	if action == "tui" {
 		checkRoot()
@@ -131,7 +218,7 @@ func main() {
 		return
 	}
 
-	if requiresRoot(action) {
+	if requiresRoot(action) || (isAdvancedAction(action) && action != "check") || (action == "runlevel" && len(args) >= 2) {
 		checkRoot()
 	}
 
@@ -140,10 +227,22 @@ func main() {
 		service = args[1]
 	}
 	if service != "" {
-		if err := validateServiceName(service); err != nil {
+		if err := runitlog.ValidateName(service); err != nil {
 			errorMsg(err.Error())
 			os.Exit(2)
 		}
+	}
+
+	switch {
+	case action == "doctor":
+		cmdDoctor()
+		return
+	case action == "runlevel":
+		cmdRunlevel(args)
+		return
+	case isAdvancedAction(action):
+		runAdvanced(action, service)
+		return
 	}
 
 	servicePath := filepath.Join(RunsvDir, service)
@@ -199,7 +298,7 @@ func main() {
 		}
 		info(T("restarting", service))
 		if !runSvCommand("restart", service) {
-			errorMsg(fmt.Sprintf("No se pudo reiniciar '%s'.", service))
+			errorMsg(T("restart_err", service))
 			os.Exit(1)
 		}
 
@@ -210,7 +309,7 @@ func main() {
 		}
 		info(T("reloading", service))
 		if !runSvCommand("hup", service) {
-			errorMsg(fmt.Sprintf("No se pudo recargar '%s'.", service))
+			errorMsg(T("reload_err", service))
 			os.Exit(1)
 		}
 
@@ -221,7 +320,7 @@ func main() {
 		}
 		info(T("pausing", service))
 		if !runSvCommand("pause", service) {
-			errorMsg(fmt.Sprintf("No se pudo pausar '%s'.", service))
+			errorMsg(T("pause_err", service))
 			os.Exit(1)
 		}
 
@@ -232,7 +331,7 @@ func main() {
 		}
 		info(T("resuming", service))
 		if !runSvCommand("cont", service) {
-			errorMsg(fmt.Sprintf("No se pudo reanudar '%s'.", service))
+			errorMsg(T("cont_err", service))
 			os.Exit(1)
 		}
 
@@ -256,7 +355,7 @@ func main() {
 			fmt.Println(T("not_exists_svdir", service, SvDir))
 			os.Exit(1)
 		}
-		if exists(servicePath) {
+		if lexists(servicePath) {
 			warn(T("already_enabled", service))
 			os.Exit(0)
 		}
@@ -275,7 +374,7 @@ func main() {
 			errorMsg(T("specify_disable"))
 			os.Exit(1)
 		}
-		if !exists(servicePath) {
+		if !lexists(servicePath) {
 			warn(T("already_disabled", service))
 			os.Exit(0)
 		}
@@ -299,7 +398,7 @@ func main() {
 			os.Exit(1)
 		}
 		downFile := filepath.Join(serviceSv, "down")
-		file, err := os.Create(downFile)
+		file, err := os.OpenFile(downFile, os.O_WRONLY|os.O_CREATE, 0o644)
 		if err != nil {
 			errorMsg(T("masked_err", service, err))
 			os.Exit(1)
@@ -373,9 +472,10 @@ func main() {
 			os.Exit(1)
 		}
 		count := 0
+		needle := strings.ToLower(service)
 		for _, file := range files {
 			name := file.Name()
-			if strings.Contains(name, service) {
+			if strings.Contains(strings.ToLower(name), needle) {
 				count++
 				if exists(filepath.Join(RunsvDir, name)) {
 					fmt.Printf("  %s●%s %-20s %s(%s)%s\n", ColorGreen, ColorReset, name, ColorGreen, T("enabled_tag"), ColorReset)
@@ -389,8 +489,8 @@ func main() {
 		}
 
 	default:
-		errorMsg(T("unknown_action"))
-		os.Exit(1)
+		errorMsg(T("unknown_action") + " (" + action + ")")
+		os.Exit(2)
 	}
 }
 
@@ -400,8 +500,11 @@ func main() {
 func renderStatus(service string) string {
 	var b strings.Builder
 
-	out, err := exec.Command("sv", "status", service).CombinedOutput()
-	output := string(out)
+	output, ok := runSvCaptured("status", service)
+	var err error
+	if !ok {
+		err = fmt.Errorf("sv status falló")
+	}
 
 	fmt.Fprintf(&b, "%s%s%s %s\n", Bold, T("status_service"), ColorReset, service)
 	if err != nil || strings.HasPrefix(output, "fail:") {

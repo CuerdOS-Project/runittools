@@ -27,10 +27,11 @@ var supportedLangs = map[string]string{
 }
 
 // detectLang determina el idioma a usar, en este orden de prioridad:
-// 1. Flag --lang=xx o -l xx (procesado externamente y pasado aquí)
-// 2. Variable de entorno RUNITCTL_LANG
-// 3. Variable de entorno LANG / LC_ALL / LC_MESSAGES del sistema
-// 4. Español como idioma por defecto
+//  1. Flag --lang=xx o -l xx (procesado externamente y pasado aquí)
+//  2. Variable de entorno RUNITCTL_LANG
+//  3. Variable de entorno LANG / LC_ALL / LC_MESSAGES del sistema
+//  4. Inglés como idioma por defecto (si el sistema está en español, pt o ca
+//     se detecta solo por las variables de entorno del paso 3)
 func detectLang(explicit string) string {
 	if explicit != "" {
 		if _, ok := supportedLangs[explicit]; ok {
@@ -51,7 +52,7 @@ func detectLang(explicit string) string {
 			}
 		}
 	}
-	return "es"
+	return "en"
 }
 
 // normalizeLangCode convierte algo como "pt_BR.UTF-8" o "ca_ES" en "pt" o "ca".
