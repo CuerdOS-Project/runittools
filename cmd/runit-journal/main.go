@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,9 +11,25 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+
+	"runitctl/internal/runitlog"
 )
 
-const serviceDir = "/etc/sv"
+// version se sobrescribe en la compilación: -ldflags "-X main.version=1.2.3".
+var version = "1.0"
+
+// Mismas variables de entorno que runitctl (ver su documentación).
+var (
+	serviceDir = envOr("RUNITCTL_SV_DIR", "/etc/sv")
+	runsvDir   = envOr("RUNITCTL_SVDIR", envOr("SVDIR", "/etc/runit/runsvdir/default"))
+)
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 type logEvent struct{ at time.Time }
 
@@ -23,7 +37,8 @@ func (e *logEvent) When() time.Time { return e.at }
 
 type logSource struct {
 	paths   []string
-	filter  bool
+	filter  bool // filtrar por servicio (logs compartidos de socklog)
+	decode  bool // decodificar prefijos TAI64N de svlogd
 	backend string
 }
 
@@ -40,7 +55,6 @@ type journalUI struct {
 	following  bool
 	paused     bool
 	mu         sync.Mutex
-	stop       chan struct{}
 	capture    *os.File
 }
 
@@ -51,9 +65,14 @@ func listServices() []string {
 	}
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() {
-			out = append(out, e.Name())
+		if runitlog.ValidateName(e.Name()) != nil {
+			continue
 		}
+		// os.Stat sigue enlaces: /etc/sv suele contener symlinks a directorios.
+		if st, err := os.Stat(filepath.Join(serviceDir, e.Name())); err != nil || !st.IsDir() {
+			continue
+		}
+		out = append(out, e.Name())
 	}
 	sort.Strings(out)
 	return out
@@ -70,68 +89,41 @@ func (u *journalUI) visibleServices() []string {
 	return out
 }
 
-func tailLines(path string, n int) ([]string, int64, error) {
-	if n < 1 {
-		return nil, 0, fmt.Errorf("el número de líneas debe ser positivo")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, 0, err
-	}
-	size := st.Size()
-	const blockSize int64 = 64 * 1024
-	const maxScan int64 = 8 * 1024 * 1024
-	var data []byte
-	pos := size
-	newlines := 0
-	for pos > 0 && newlines <= n && size-pos < maxScan {
-		readSize := blockSize
-		if readSize > pos {
-			readSize = pos
-		}
-		pos -= readSize
-		buf := make([]byte, readSize)
-		if _, err := f.ReadAt(buf, pos); err != nil && err != io.EOF {
-			return nil, size, err
-		}
-		newlines += strings.Count(string(buf), "\n")
-		data = append(buf, data...)
-	}
-	text := strings.TrimRight(string(data), "\n")
-	if text == "" {
-		return nil, size, nil
-	}
-	all := strings.Split(text, "\n")
-	if len(all) > n {
-		all = all[len(all)-n:]
-	}
-	return all, size, nil
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 func resolveLog(service string) (logSource, error) {
-	if err := validateServiceName(service); err != nil {
+	if err := runitlog.ValidateName(service); err != nil {
 		return logSource{}, err
 	}
-	classic := []string{
-		"/etc/runit/runsvdir/default/" + service + "/log/main/current",
-		"/etc/runit/runsvdir/default/" + service + "/log/current",
-		"/var/service/" + service + "/log/main/current",
-		"/var/service/" + service + "/log/current",
-		"/etc/sv/" + service + "/log/main/current",
-		"/etc/sv/" + service + "/log/current",
-		"/var/log/runit/" + service + "/current",
+	type cand struct {
+		path   string
+		decode bool
 	}
-	for _, p := range classic {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return logSource{[]string{p}, false, "runit log/current"}, nil
+	classic := []cand{
+		{runsvDir + "/" + service + "/log/main/current", true},
+		{runsvDir + "/" + service + "/log/current", true},
+		{"/var/service/" + service + "/log/main/current", true},
+		{"/var/service/" + service + "/log/current", true},
+		{serviceDir + "/" + service + "/log/main/current", true},
+		{serviceDir + "/" + service + "/log/current", true},
+		{"/var/log/sv/" + service + "/current", true},
+		{"/var/log/" + service + "/current", true},
+		{"/var/log/runit/" + service + "/current", false}, // texto plano con timestamps legibles
+	}
+	for _, c := range classic {
+		if st, err := os.Stat(c.path); err == nil && !st.IsDir() {
+			return logSource{paths: []string{c.path}, decode: c.decode, backend: "registro del servicio"}, nil
 		}
 	}
-	root := "/var/log/socklog"
+	root := envOr("RUNITCTL_SOCKLOG_DIR", "/var/log/socklog")
+	// "everything" (socklog-void) ya agrupa todas las clases: usarla sola
+	// evita duplicar líneas.
+	if every := filepath.Join(root, "everything", "current"); fileExists(every) {
+		return logSource{paths: []string{every}, filter: true, backend: "registro del sistema (socklog)"}, nil
+	}
 	entries, err := os.ReadDir(root)
 	if err == nil {
 		var paths []string
@@ -145,10 +137,10 @@ func resolveLog(service string) (logSource, error) {
 			}
 		}
 		if len(paths) > 0 {
-			return logSource{paths, true, "socklog (todas las clases)"}, nil
+			return logSource{paths: paths, filter: true, backend: "registro del sistema (socklog)"}, nil
 		}
 	}
-	return logSource{}, fmt.Errorf("no se encontró un log para %s", service)
+	return logSource{}, fmt.Errorf("No encontré registros para %s", service)
 }
 
 func matchesService(line, service string) bool {
@@ -166,28 +158,37 @@ func matchesService(line, service string) bool {
 
 func loadHistory(src logSource, service string, n int) ([]string, error) {
 	var lines []string
+	var firstErr error
 	for _, path := range src.paths {
-		part, _, err := tailLines(path, 10000)
+		part, err := runitlog.ReadTailLines(path, 10000)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		lines = append(lines, part...)
 	}
-	sort.Strings(lines)
-	if !src.filter {
-		if len(lines) > n {
-			lines = lines[len(lines)-n:]
-		}
-		return lines, nil
+	if len(lines) == 0 && firstErr != nil {
+		return nil, firstErr
 	}
-	out := make([]string, 0, n)
-	for _, line := range lines {
-		if matchesService(line, service) {
-			out = append(out, line)
+	sort.Strings(lines)
+	out := lines
+	if src.filter {
+		out = make([]string, 0, n)
+		for _, line := range lines {
+			if matchesService(line, service) {
+				out = append(out, line)
+			}
 		}
 	}
 	if len(out) > n {
 		out = out[len(out)-n:]
+	}
+	if src.decode {
+		for i, l := range out {
+			out[i] = runitlog.DecodeTai64n(l)
+		}
 	}
 	return out, nil
 }
@@ -215,9 +216,9 @@ func (u *journalUI) drawSelect(s tcell.Screen) {
 	normal := tcell.StyleDefault.Foreground(tcell.ColorWhite)
 	selected := tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightCyan).Bold(true)
 	dim := tcell.StyleDefault.Foreground(tcell.ColorGray)
-	draw(s, 1, 0, title, "runit-journal — visor de logs runit (tcell)")
-	draw(s, 1, 1, dim, "↑/↓ seleccionar  Enter abrir  / buscar  Esc/q salir")
-	draw(s, 1, 2, dim, "Servicio: "+u.filter)
+	draw(s, 1, 0, title, "runit-journal — ver los registros de tus servicios")
+	draw(s, 1, 1, dim, "↑/↓ moverse  Enter abrir  / buscar  Esc/q salir")
+	draw(s, 1, 2, dim, "Buscando: "+u.filter)
 	list := u.visibleServices()
 	u.cursor = clamp(u.cursor, 0, len(list)-1)
 	rows := h - 5
@@ -239,9 +240,9 @@ func (u *journalUI) drawSelect(s tcell.Screen) {
 		draw(s, 0, 4+row, st, fmt.Sprintf("%4d  %s", i+1, list[i]))
 	}
 	if len(list) == 0 {
-		draw(s, 1, 4, dim, "No hay servicios que coincidan.")
+		draw(s, 1, 4, dim, "No hay servicios con ese nombre.")
 	}
-	draw(s, 1, h-1, dim, "Enter: ver logging   /: buscar   q/Esc: salir")
+	draw(s, 1, h-1, dim, "Enter: ver registros   /: buscar   q/Esc: salir")
 	s.Show()
 }
 
@@ -250,7 +251,7 @@ func prompt(s tcell.Screen, current string) (string, bool) {
 	for {
 		s.Clear()
 		draw(s, 1, 1, tcell.StyleDefault.Foreground(tcell.ColorWhite), "Buscar servicio: "+string(v))
-		draw(s, 1, 3, tcell.StyleDefault.Foreground(tcell.ColorGray), "Enter aplicar   Esc cancelar   Backspace borrar")
+		draw(s, 1, 3, tcell.StyleDefault.Foreground(tcell.ColorGray), "Enter: buscar   Esc: cancelar   Retroceso: borrar")
 		s.Show()
 		ev := s.PollEvent()
 		k, ok := ev.(*tcell.EventKey)
@@ -280,16 +281,16 @@ func (u *journalUI) drawLog(s tcell.Screen) {
 	title := tcell.StyleDefault.Foreground(tcell.ColorLightCyan).Bold(true)
 	dim := tcell.StyleDefault.Foreground(tcell.ColorGray)
 	normal := tcell.StyleDefault.Foreground(tcell.ColorWhite)
-	state := "pausado"
-	if u.following && !u.paused {
-		state = "en vivo"
-	}
-	draw(s, 0, 0, title, fmt.Sprintf(" log: %s | %s | %s", u.service, u.source.backend, state))
 	view := h - 3
 	if view < 1 {
 		view = 1
 	}
 	u.mu.Lock()
+	state := "en pausa"
+	if u.following && !u.paused {
+		state = "en vivo"
+	}
+	draw(s, 0, 0, title, fmt.Sprintf(" Registros de %s | %s | %s", u.service, u.source.backend, state))
 	if u.autoScroll {
 		u.offset = max(0, len(u.log)-view)
 	}
@@ -308,95 +309,67 @@ func (u *journalUI) drawLog(s tcell.Screen) {
 	empty := len(u.log) == 0
 	u.mu.Unlock()
 	if empty {
-		draw(s, 1, 2, dim, "No hay historial; esperando nuevas líneas...")
+		draw(s, 1, 2, dim, "Todavía no hay registros; esperando nuevas líneas...")
 	}
-	draw(s, 0, h-1, dim, " ↑/↓/Pg mover  ←/→ horizontal  f pausa  r recargar  g/G inicio/fin  q/Esc volver")
+	draw(s, 0, h-1, dim, " ↑/↓/Pg moverse  ←/→ desplazar  f pausar  r recargar  g/G inicio/final  q/Esc volver")
 	if w > 0 {
 		s.Show()
 	}
 }
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
+// appendLine añade una línea nueva al buffer y a la captura. En pausa la
+// línea se guarda igualmente (y se captura), solo se congela la vista.
 func (u *journalUI) appendLine(line string) {
 	u.mu.Lock()
+	defer u.mu.Unlock()
 	u.log = append(u.log, line)
 	if u.following && !u.paused {
 		u.autoScroll = true
 	}
 	if len(u.log) > 10000 {
-		u.log = u.log[len(u.log)-10000:]
+		drop := len(u.log) - 10000
+		u.log = u.log[drop:]
+		if !u.autoScroll {
+			u.offset = max(0, u.offset-drop) // mantiene la vista sobre las mismas líneas
+		}
 	}
 	if u.capture != nil {
 		_, _ = fmt.Fprintln(u.capture, line)
 		_ = u.capture.Sync()
 	}
-	u.mu.Unlock()
 }
 
-func (u *journalUI) followLoop(screen tcell.Screen) {
-	positions := make(map[string]int64)
+// followLoop sigue cada archivo de la fuente en su propia goroutine
+// (runitlog.FollowFile: tolera rotación de svlogd, truncado y líneas
+// parciales) y avisa a la pantalla para que redibuje.
+func (u *journalUI) followLoop(screen tcell.Screen, stop <-chan struct{}) {
+	var wg sync.WaitGroup
 	for _, path := range u.source.paths {
-		if st, err := os.Stat(path); err == nil {
-			positions[path] = st.Size()
-		}
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			runitlog.FollowFile(p, 300*time.Millisecond, stop, func(line string) {
+				if u.source.filter && !matchesService(line, u.service) {
+					return
+				}
+				if u.source.decode {
+					line = runitlog.DecodeTai64n(line)
+				}
+				u.appendLine(line)
+				_ = screen.PostEvent(&logEvent{at: time.Now()}) // si la cola está llena ya hay un redibujo pendiente
+			})
+		}(path)
 	}
-	ticker := time.NewTicker(300 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-u.stop:
-			return
-		case <-ticker.C:
-			if u.paused {
-				continue
-			}
-			for _, path := range u.source.paths {
-				f, err := os.Open(path)
-				if err != nil {
-					continue
-				}
-				pos := positions[path]
-				if st, statErr := f.Stat(); statErr == nil && st.Size() < pos {
-					pos = 0
-					positions[path] = 0
-				}
-				if _, err = f.Seek(pos, 0); err != nil {
-					f.Close()
-					continue
-				}
-				sc := bufio.NewScanner(f)
-				sc.Buffer(make([]byte, 64*1024), 1024*1024)
-				for sc.Scan() {
-					line := sc.Text()
-					if !u.source.filter || matchesService(line, u.service) {
-						u.appendLine(line)
-					}
-				}
-				if err := sc.Err(); err != nil {
-					u.appendLine(fmt.Sprintf("[runit-journal] error leyendo %s: %v", path, err))
-				}
-				if st, err := f.Stat(); err == nil {
-					positions[path] = st.Size()
-				}
-				f.Close()
-			}
-			screen.PostEvent(&logEvent{at: time.Now()})
-		}
-	}
+	wg.Wait()
 }
 
 func (u *journalUI) openLog(s tcell.Screen, service string, follow bool, lines int, grab bool, dir string) {
-	if err := validateServiceName(service); err != nil {
+	if err := runitlog.ValidateName(service); err != nil {
 		show(s, err.Error())
 		return
 	}
 	if lines < 1 || lines > 100000 {
-		show(s, "-n debe estar entre 1 y 100000")
+		show(s, "Después de -n escribe un número entre 1 y 100000.")
 		return
 	}
 	src, err := resolveLog(service)
@@ -417,50 +390,65 @@ func (u *journalUI) openLog(s tcell.Screen, service string, follow bool, lines i
 		u.log = h
 	}
 	if grab {
-		if dir == "" {
-			dir = os.Getenv("HOME") + "/.local/state/runitctl/logs"
-		}
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			show(s, fmt.Sprintf("no se pudo crear la carpeta de captura: %v", err))
+		f, err := runitlog.OpenCapture(service, dir)
+		if err != nil {
+			show(s, fmt.Sprintf("No se pudo guardar la copia: %v", err))
 			return
 		}
-		p := filepath.Join(dir, safeLogName(service)+"-"+time.Now().Format("20060102-150405.000000000")+".log")
-		var captureErr error
-		u.capture, captureErr = os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-		if captureErr != nil {
-			show(s, fmt.Sprintf("no se pudo abrir la captura: %v", captureErr))
-			return
+		for _, line := range u.log {
+			_, _ = fmt.Fprintln(f, line)
 		}
-		if u.capture != nil {
-			for _, line := range u.log {
-				_, _ = fmt.Fprintln(u.capture, line)
-			}
-			_ = u.capture.Sync()
-		}
+		_ = f.Sync()
+		u.mu.Lock()
+		u.capture = f
+		u.mu.Unlock()
 	}
+	var stop chan struct{}
+	var followDone chan struct{}
 	if follow {
-		u.stop = make(chan struct{})
-		go u.followLoop(s)
+		stop = make(chan struct{})
+		followDone = make(chan struct{})
+		go func() { u.followLoop(s, stop); close(followDone) }()
 	}
 	defer func() {
-		if u.stop != nil {
-			close(u.stop)
+		if stop != nil {
+			close(stop)
+			<-followDone // evita escribir en la captura ya cerrada
 		}
+		u.mu.Lock()
 		if u.capture != nil {
+			_ = u.capture.Sync()
 			u.capture.Close()
 			u.capture = nil
 		}
+		u.mu.Unlock()
 	}()
 	for {
 		u.drawLog(s)
 		ev := s.PollEvent()
 		k, ok := ev.(*tcell.EventKey)
 		if !ok {
+			if _, resize := ev.(*tcell.EventResize); resize {
+				s.Sync()
+			}
 			continue
 		}
+		u.mu.Lock() // el seguimiento en vivo toca offset/autoScroll/log desde otra goroutine
+		quit := u.handleLogKey(s, k, src, service, lines)
+		u.mu.Unlock()
+		if quit {
+			return
+		}
+	}
+}
+
+// handleLogKey procesa una tecla del visor de log. Debe llamarse con u.mu
+// tomado. Devuelve true si hay que salir del visor.
+func (u *journalUI) handleLogKey(s tcell.Screen, k *tcell.EventKey, src logSource, service string, lines int) bool {
+	{
 		switch k.Key() {
 		case tcell.KeyEscape:
-			return
+			return true
 		case tcell.KeyUp:
 			u.offset = max(0, u.offset-1)
 			u.autoScroll = false
@@ -489,52 +477,96 @@ func (u *journalUI) openLog(s tcell.Screen, service string, follow bool, lines i
 		case tcell.KeyRune:
 			switch k.Rune() {
 			case 'q':
-				return
+				return true
 			case 'f':
 				u.paused = !u.paused
 				if !u.paused {
 					u.autoScroll = true
 				}
 			case 'r':
-				h, _ := loadHistory(src, service, lines)
-				u.mu.Lock()
-				u.log = h
-				u.mu.Unlock()
+				if h, err := loadHistory(src, service, lines); err == nil {
+					u.log = h
+				}
 			case 'g':
 				u.offset = 0
+				u.autoScroll = false
 			case 'G':
 				u.offset = 999999
+				u.autoScroll = true
 			}
 		}
 	}
+	return false
 }
+
 func show(s tcell.Screen, msg string) {
 	s.Clear()
 	draw(s, 1, 1, tcell.StyleDefault.Foreground(tcell.ColorRed), msg)
-	draw(s, 1, 3, tcell.StyleDefault.Foreground(tcell.ColorGray), "Presiona una tecla para volver")
+	draw(s, 1, 3, tcell.StyleDefault.Foreground(tcell.ColorGray), "Pulsa una tecla para volver")
 	s.Show()
 	s.PollEvent()
 }
 
+// parseArgs analiza args permitiendo flags antes y después de los
+// argumentos posicionales (`runit-journal nginx -n 200`, como documenta el
+// README). El paquete flag por sí solo se detiene en el primer posicional e
+// ignoraría en silencio todo lo que viene después.
+func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		args = fs.Args()
+		if len(args) == 0 {
+			return pos, nil
+		}
+		pos = append(pos, args[0])
+		args = args[1:]
+	}
+}
+
 func main() {
-	follow := flag.Bool("f", true, "seguir el log en vivo")
-	lines := flag.Int("n", 200, "líneas históricas")
-	grab := flag.Bool("g", false, "guardar en .log")
-	dir := flag.String("log-dir", "", "carpeta de captura")
-	flag.Parse()
-	if *lines < 1 || *lines > 100000 {
-		fmt.Fprintln(os.Stderr, "-n debe ser un entero entre 1 y 100000")
+	fs := flag.NewFlagSet("runit-journal", flag.ContinueOnError)
+	follow := fs.Bool("f", true, "seguir el log en vivo (-f=false para solo historial)")
+	lines := fs.Int("n", 200, "líneas históricas (1-100000)")
+	grab := fs.Bool("g", false, "guardar el historial y las líneas nuevas en un .log")
+	dir := fs.String("log-dir", "", "carpeta de captura (por defecto $XDG_STATE_HOME/runitctl/logs)")
+	showVersion := fs.Bool("version", false, "mostrar la versión y salir")
+	fs.BoolVar(showVersion, "v", false, "mostrar la versión y salir")
+	fs.BoolVar(showVersion, "V", false, "mostrar la versión y salir")
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "Uso: runit-journal [opciones] [servicio]")
+		fs.PrintDefaults()
+	}
+	pos, err := parseArgs(fs, os.Args[1:])
+	if err != nil {
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
 		os.Exit(2)
 	}
-	if flag.NArg() > 0 {
-		if err := validateServiceName(flag.Arg(0)); err != nil {
+	if *showVersion {
+		fmt.Println("runit-journal " + version)
+		return
+	}
+	if len(pos) > 1 {
+		fmt.Fprintln(os.Stderr, "Indica un solo servicio.")
+		os.Exit(2)
+	}
+	if *lines < 1 || *lines > 100000 {
+		fmt.Fprintln(os.Stderr, "Después de -n escribe un número entre 1 y 100000.")
+		os.Exit(2)
+	}
+	if len(pos) == 1 {
+		if err := runitlog.ValidateName(pos[0]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 	}
 	list := listServices()
-	if flag.NArg() > 0 {
-		list = []string{flag.Arg(0)}
+	if len(pos) == 1 {
+		list = []string{pos[0]}
 	}
 	s, err := tcell.NewScreen()
 	if err != nil {
@@ -547,13 +579,17 @@ func main() {
 	}
 	defer s.Fini()
 	u := &journalUI{services: list}
-	if flag.NArg() > 0 {
-		u.openLog(s, flag.Arg(0), *follow, *lines, *grab, *dir)
+	if len(pos) == 1 {
+		u.openLog(s, pos[0], *follow, *lines, *grab, *dir)
 		return
 	}
 	for {
 		u.drawSelect(s)
 		ev := s.PollEvent()
+		if _, ok := ev.(*tcell.EventResize); ok {
+			s.Sync()
+			continue
+		}
 		k, ok := ev.(*tcell.EventKey)
 		if !ok {
 			continue
@@ -569,6 +605,10 @@ func main() {
 			u.cursor = max(0, u.cursor-10)
 		case tcell.KeyPgDn:
 			u.cursor += 10
+		case tcell.KeyHome:
+			u.cursor = 0
+		case tcell.KeyEnd:
+			u.cursor = 1 << 30 // drawSelect lo acota al último
 		case tcell.KeyEnter:
 			vis := u.visibleServices()
 			if len(vis) > 0 {

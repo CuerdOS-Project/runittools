@@ -3,12 +3,20 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
+
+	"runitctl/internal/runitlog"
 )
+
+// probeWorkers limita cuántos 'sv status' se lanzan a la vez al cargar la
+// lista: con decenas de servicios, sondearlos uno a uno hacía que la TUI
+// tardara en abrir.
+const probeWorkers = 8
 
 // ---------------------------------------------------------------------
 // Modelo de datos de servicios
@@ -20,11 +28,13 @@ const (
 	stateRunning svState = iota
 	stateStopped
 	stateFailed
+	statePaused
 )
 
 type serviceEntry struct {
 	name    string
 	enabled bool
+	masked  bool // existe SvDir/<svc>/down: no arrancará solo
 	state   svState
 	detail  string
 }
@@ -36,6 +46,14 @@ func loadServiceNames() ([]string, error) {
 	}
 	names := make([]string, 0, len(files))
 	for _, f := range files {
+		// Solo directorios (o enlaces a directorios) con nombre válido: así no
+		// aparecen archivos sueltos ni nombres que 'sv' interpretaría mal.
+		if runitlog.ValidateName(f.Name()) != nil {
+			continue
+		}
+		if st, err := os.Stat(filepath.Join(SvDir, f.Name())); err != nil || !st.IsDir() {
+			continue
+		}
 		names = append(names, f.Name())
 	}
 	sort.Strings(names)
@@ -44,15 +62,17 @@ func loadServiceNames() ([]string, error) {
 
 // probeService consulta 'sv status' de un servicio y clasifica su estado.
 func probeService(name string) (svState, string) {
-	out, err := exec.Command("sv", "status", name).CombinedOutput()
-	output := string(out)
-	if err != nil || strings.HasPrefix(output, "fail:") {
-		return stateFailed, strings.TrimSpace(output)
+	output, ok := runSvCaptured("status", name)
+	if !ok || strings.HasPrefix(output, "fail:") {
+		return stateFailed, output
 	}
 	if strings.HasPrefix(output, "run:") {
-		return stateRunning, strings.TrimSpace(output)
+		if strings.Contains(output, ", paused") || strings.Contains(output, "; paused") {
+			return statePaused, output
+		}
+		return stateRunning, output
 	}
-	return stateStopped, strings.TrimSpace(output)
+	return stateStopped, output
 }
 
 func loadServices() ([]serviceEntry, error) {
@@ -60,16 +80,34 @@ func loadServices() ([]serviceEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]serviceEntry, 0, len(names))
-	for _, name := range names {
-		enabled := exists(RunsvDir + "/" + name)
-		state, detail := stateStopped, ""
-		if enabled {
-			state, detail = probeService(name)
+	entries := make([]serviceEntry, len(names))
+	sem := make(chan struct{}, probeWorkers)
+	var wg sync.WaitGroup
+	for i, name := range names {
+		enabled := lexists(RunsvDir + "/" + name)
+		entries[i] = serviceEntry{name: name, enabled: enabled, state: stateStopped, masked: exists(filepath.Join(SvDir, name, "down"))}
+		if !enabled {
+			continue
 		}
-		entries = append(entries, serviceEntry{name: name, enabled: enabled, state: state, detail: detail})
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			entries[i].state, entries[i].detail = probeService(name)
+		}(i, name)
 	}
+	wg.Wait()
 	return entries, nil
+}
+
+// reloadServices vuelve a leer la lista; si falla (p. ej. /etc/sv no
+// accesible un instante) conserva la anterior en vez de dejar la pantalla vacía.
+func reloadServices(old []serviceEntry) []serviceEntry {
+	if fresh, err := loadServices(); err == nil {
+		return fresh
+	}
+	return old
 }
 
 func matchesQuery(name, query string) bool {
@@ -123,20 +161,31 @@ var (
 	styleQuery    = tcell.StyleDefault.Foreground(tcell.ColorYellow)
 	styleSelected = tcell.StyleDefault.Background(tcell.ColorBlue).Foreground(tcell.ColorWhite).Bold(true)
 	styleRunning  = tcell.StyleDefault.Foreground(tcell.ColorGreen)
-	styleStopped  = tcell.StyleDefault.Foreground(tcell.ColorYellow)
+	styleMasked   = tcell.StyleDefault.Foreground(tcell.ColorYellow)
 	styleFailed   = tcell.StyleDefault.Foreground(tcell.ColorRed)
 	styleFooter   = tcell.StyleDefault.Background(tcell.ColorYellow).Foreground(tcell.ColorBlack)
 	styleMenuBox  = tcell.StyleDefault.Foreground(tcell.ColorWhite)
 )
 
-func stateGlyph(s svState) (string, tcell.Style) {
-	switch s {
-	case stateRunning:
+// stateGlyph elige el símbolo y color de un servicio: verde = en marcha,
+// rojo = detenido o con fallo, amarillo = pausado o enmascarado, gris =
+// no habilitado.
+func stateGlyph(e serviceEntry) (string, tcell.Style) {
+	switch {
+	case !e.enabled && e.masked:
+		return "⊘", styleMasked
+	case !e.enabled:
+		return "○", styleDim
+	case e.state == stateRunning:
 		return "●", styleRunning
-	case stateFailed:
+	case e.state == statePaused:
+		return "‖", styleMasked
+	case e.state == stateFailed:
 		return "✖", styleFailed
+	case e.masked:
+		return "⊘", styleMasked
 	default:
-		return "○", styleStopped
+		return "○", styleFailed // habilitado pero detenido
 	}
 }
 
@@ -180,7 +229,7 @@ func runTUI() {
 		}
 
 		width, height := screen.Size()
-		listRows := maxInt(1, height-6)
+		listRows := maxInt(1, height-7)
 		if cursor < offset {
 			offset = cursor
 		}
@@ -203,7 +252,7 @@ func runTUI() {
 		for row := 0; row < listRows && row+offset < len(filtered); row++ {
 			pos := row + offset
 			s := services[filtered[pos]]
-			glyph, glyphStyle := stateGlyph(s.state)
+			glyph, glyphStyle := stateGlyph(s)
 			enabledLabel := T("disabled_tag")
 			if s.enabled {
 				enabledLabel = T("enabled_tag")
@@ -220,6 +269,7 @@ func runTUI() {
 			drawText(screen, 34, y, width-34, enabledLabel, lineStyle)
 		}
 
+		drawText(screen, 0, height-2, width, " "+T("tui_legend"), styleDim)
 		drawText(screen, 0, height-1, width, " "+T("tui_help_bar"), styleFooter)
 		screen.Show()
 
@@ -243,7 +293,7 @@ func runTUI() {
 						if len(filtered) > 0 {
 							name := services[filtered[cursor]].name
 							actionMenu(screen, name)
-							services, _ = loadServices()
+							services = reloadServices(services)
 						}
 					}
 				}
@@ -279,7 +329,7 @@ func runTUI() {
 				if len(filtered) > 0 {
 					name := services[filtered[cursor]].name
 					actionMenu(screen, name)
-					services, _ = loadServices()
+					services = reloadServices(services)
 				}
 			default:
 				r := ev.Rune()
@@ -292,7 +342,7 @@ func runTUI() {
 					cursor, offset = 0, 0
 				case 'r', 'R':
 					if len(query) == 0 {
-						services, _ = loadServices()
+						services = reloadServices(services)
 					} else {
 						query = append(query, r)
 						cursor, offset = 0, 0
@@ -318,38 +368,31 @@ type menuAction struct {
 	run   func(service string) (string, bool)
 }
 
+// svAction arma una acción del menú que ejecuta 'sv <cmd>' capturando su
+// salida y devuelve el mensaje de éxito/error correspondiente. Antes
+// restart/reload/pause/cont ignoraban el resultado y siempre mostraban éxito.
+func svAction(key, label, svCmd, okKey, errKey string) menuAction {
+	return menuAction{key, label, func(s string) (string, bool) {
+		out, ok := runSvCaptured(svCmd, s)
+		if ok {
+			return T(okKey, s), true
+		}
+		msg := T(errKey, s)
+		if out != "" {
+			msg += "\n" + out
+		}
+		return msg, false
+	}}
+}
+
 func buildActions() []menuAction {
 	return []menuAction{
-		{"start", T("help_start"), func(s string) (string, bool) {
-			ok := runSvCommandCaptured("up", s)
-			if ok {
-				return T("started_ok", s), true
-			}
-			return T("started_err", s), false
-		}},
-		{"stop", T("help_stop"), func(s string) (string, bool) {
-			ok := runSvCommandCaptured("down", s)
-			if ok {
-				return T("stopped_ok", s), true
-			}
-			return T("stopped_err", s), false
-		}},
-		{"restart", T("help_restart"), func(s string) (string, bool) {
-			runSvCommandCaptured("restart", s)
-			return T("restarting", s), true
-		}},
-		{"reload", T("help_reload"), func(s string) (string, bool) {
-			runSvCommandCaptured("hup", s)
-			return T("reloading", s), true
-		}},
-		{"pause", T("help_pause"), func(s string) (string, bool) {
-			runSvCommandCaptured("pause", s)
-			return T("pausing", s), true
-		}},
-		{"cont", T("help_cont"), func(s string) (string, bool) {
-			runSvCommandCaptured("cont", s)
-			return T("resuming", s), true
-		}},
+		svAction("start", T("help_start"), "up", "started_ok", "started_err"),
+		svAction("stop", T("help_stop"), "down", "stopped_ok", "stopped_err"),
+		svAction("restart", T("help_restart"), "restart", "restarted_ok", "restart_err"),
+		svAction("reload", T("help_reload"), "hup", "reloaded_ok", "reload_err"),
+		svAction("pause", T("help_pause"), "pause", "paused_ok", "pause_err"),
+		svAction("cont", T("help_cont"), "cont", "resumed_ok", "cont_err"),
 		{"status", T("help_status"), func(s string) (string, bool) {
 			return renderStatus(s), true
 		}},
@@ -384,7 +427,7 @@ func actionMenu(screen tcell.Screen, service string) {
 		for y := y0; y < y0+boxH; y++ {
 			fillRow(screen, y, width, styleMenuBox)
 		}
-		title := fmt.Sprintf(T("tui_action_menu", service))
+		title := T("tui_action_menu", service)
 		drawText(screen, x0+1, y0, boxW-2, title, styleTitle)
 		for i, a := range actions {
 			style := styleNormal
@@ -515,17 +558,13 @@ func stripAnsi(s string) string {
 // Operaciones reutilizadas por el menú (misma lógica que el CLI)
 // ---------------------------------------------------------------------
 
-func runSvCommandCaptured(command, service string) bool {
-	return runSvCommand(command, service)
-}
-
 func enableService(service string) (string, bool) {
 	serviceSv := SvDir + "/" + service
 	servicePath := RunsvDir + "/" + service
 	if !exists(serviceSv) {
 		return T("not_exists_svdir", service, SvDir), false
 	}
-	if exists(servicePath) {
+	if lexists(servicePath) {
 		return T("already_enabled", service), true
 	}
 	if err := os.Symlink(serviceSv, servicePath); err != nil {
@@ -536,7 +575,7 @@ func enableService(service string) (string, bool) {
 
 func disableService(service string) (string, bool) {
 	servicePath := RunsvDir + "/" + service
-	if !exists(servicePath) {
+	if !lexists(servicePath) {
 		return T("already_disabled", service), true
 	}
 	if err := os.Remove(servicePath); err != nil {
@@ -553,7 +592,7 @@ func toggleMask(service string) (string, bool) {
 		}
 		return T("unmasked_ok", service), true
 	}
-	f, err := os.Create(downFile)
+	f, err := os.OpenFile(downFile, os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return T("masked_err", service, err), false
 	}
