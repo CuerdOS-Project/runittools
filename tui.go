@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -127,12 +136,60 @@ func drawText(screen tcell.Screen, x, y, width int, text string, style tcell.Sty
 	}
 	runes := []rune(text)
 	if len(runes) > width {
-		runes = runes[:width]
+		// Se marca el recorte con «…» para que no parezca un texto incompleto.
+		runes = append(runes[:width-1], '…')
 	}
 	for _, r := range runes {
 		screen.SetContent(x, y, r, nil, style)
 		x++
 	}
+}
+
+// wrapText parte el texto en líneas de como máximo width caracteres,
+// cortando por palabras (y por caracteres las palabras más largas que width).
+func wrapText(text string, width int) []string {
+	if width < 1 {
+		return []string{text}
+	}
+	var out []string
+	for _, para := range strings.Split(text, "\n") {
+		indent := []rune(para[:len(para)-len(strings.TrimLeft(para, " "))])
+		if len(indent) >= width {
+			indent = nil
+		}
+		line := append([]rune{}, indent...)
+		for _, w := range strings.Fields(para) {
+			wr := []rune(w)
+			for len(wr) > width-len(indent) {
+				if len(line) > len(indent) {
+					out = append(out, string(line))
+					line = append([]rune{}, indent...)
+				}
+				n := width - len(indent)
+				out = append(out, string(append(append([]rune{}, indent...), wr[:n]...)))
+				wr = wr[n:]
+			}
+			switch {
+			case len(line) == len(indent):
+				line = append(line, wr...)
+			case len(line)+1+len(wr) <= width:
+				line = append(append(line, ' '), wr...)
+			default:
+				out = append(out, string(line))
+				line = append(append([]rune{}, indent...), wr...)
+			}
+		}
+		out = append(out, string(line))
+	}
+	return out
+}
+
+func maxRunes(lines []string) int {
+	m := 0
+	for _, l := range lines {
+		m = maxInt(m, len([]rune(l)))
+	}
+	return m
 }
 
 func fillRow(screen tcell.Screen, y, width int, style tcell.Style) {
@@ -418,7 +475,11 @@ func actionMenu(screen tcell.Screen, service string) {
 
 	for {
 		width, height := screen.Size()
-		boxW := minInt(width-4, 50)
+		longest := 0
+		for _, a := range actions {
+			longest = maxInt(longest, len([]rune(a.label)))
+		}
+		boxW := minInt(width-4, maxInt(50, longest+6))
 		boxH := minInt(height-4, len(actions)+4)
 		x0 := (width - boxW) / 2
 		y0 := (height - boxH) / 2
@@ -502,10 +563,12 @@ func actionMenu(screen tcell.Screen, service string) {
 // multilínea como el estado detallado) y espera una pulsación de tecla o
 // clic para continuar.
 func showMessage(screen tcell.Screen, service, msg string) {
-	lines := strings.Split(strings.TrimRight(msg, "\n"), "\n")
+	msg = stripAnsi(strings.TrimRight(msg, "\n"))
 	for {
 		width, height := screen.Size()
-		boxW := minInt(width-4, maxInt(40, len(service)+20))
+		raw := strings.Split(msg, "\n")
+		boxW := minInt(width-4, maxInt(40, maxInt(len(service)+20, maxRunes(raw)+2)))
+		lines := wrapText(msg, boxW-2)
 		boxH := minInt(height-4, len(lines)+4)
 		x0 := (width - boxW) / 2
 		y0 := (height - boxH) / 2
@@ -518,7 +581,7 @@ func showMessage(screen tcell.Screen, service, msg string) {
 			if i >= boxH-3 {
 				break
 			}
-			drawText(screen, x0+1, y0+1+i, boxW-2, stripAnsi(line), styleNormal)
+			drawText(screen, x0+1, y0+1+i, boxW-2, line, styleNormal)
 		}
 		drawText(screen, x0+1, y0+boxH-1, boxW-2, T("tui_press_key"), styleDim)
 		screen.Show()

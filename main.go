@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -14,7 +23,7 @@ import (
 )
 
 // version se sobrescribe en la compilación: -ldflags "-X main.version=1.2.3".
-var version = "1.0"
+var version = "1.1"
 
 // svCommandTimeout acota las consultas/acciones de 'sv' para que un runsv
 // colgado no congele la CLI ni la TUI.
@@ -99,7 +108,7 @@ func lexists(path string) bool {
 func printHelp() {
 	fmt.Printf("%s%s%s  v%s\n\n", Bold, T("help_title"), ColorReset, version)
 	fmt.Printf("%s%s%s\n", Bold, T("help_usage"), ColorReset)
-	fmt.Println("  runitctl [--lang es|en|pt|ca] <acción> [servicio]")
+	fmt.Println("  runitctl [--lang es|en|pt|ca|de|it] <acción> [servicio]")
 	fmt.Println()
 	fmt.Printf("%s%s%s\n", Bold, T("help_service_actions"), ColorReset)
 	fmt.Printf("  %sstart%s <servicio>      - %s\n", ColorGreen, ColorReset, T("help_start"))
@@ -133,6 +142,7 @@ func printHelp() {
 	fmt.Printf("  %s--version%s, -v, -V    - %s\n", ColorGreen, ColorReset, T("help_version"))
 	fmt.Printf("  %ssetup-logs%s           - %s\n", ColorGreen, ColorReset, T("help_setup_logs"))
 	fmt.Printf("  %stui%s                  - %s\n", ColorGreen, ColorReset, T("help_tui"))
+	fmt.Printf("  %scompletion%s <shell>   - %s\n", ColorGreen, ColorReset, T("help_completion"))
 	os.Exit(0)
 }
 
@@ -190,6 +200,15 @@ func parseArgs(args []string) (lang string, rest []string) {
 }
 
 func main() {
+	// El comando oculto del autocompletado recibe la línea tal cual, con
+	// --lang/-l incluidos, así que se atiende antes de analizar los flags.
+	if len(os.Args) > 1 && os.Args[1] == "__complete" {
+		// Si la línea ya trae --lang/-l, las descripciones usan ese idioma.
+		l, _ := parseArgs(os.Args[2:])
+		initI18n(l)
+		cmdComplete(os.Args[2:])
+		return
+	}
 	lang, args := parseArgs(os.Args[1:])
 	initI18n(lang)
 
@@ -201,6 +220,10 @@ func main() {
 
 	if action == "--help" || action == "-h" || action == "help" {
 		printHelp()
+	}
+	if action == "completion" {
+		cmdCompletion(args[1:])
+		return
 	}
 	if action == "setup-logs" {
 		checkRoot()

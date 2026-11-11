@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -7,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -524,7 +534,7 @@ func TestVersionFlagsAndExtraTools(t *testing.T) {
 	e := newFakeEnv(t)
 	e.addService(t, "nginx", true)
 	for _, f := range []string{"-v", "-V", "--version", "version"} {
-		if out, code := e.runCLI(t, f); code != 0 || !strings.HasPrefix(out, "runitctl 1.0") {
+		if out, code := e.runCLI(t, f); code != 0 || !strings.HasPrefix(out, "runitctl 1.1") {
 			t.Errorf("%s: (%d) %q", f, code, out)
 		}
 	}
@@ -548,5 +558,100 @@ func TestVersionFlagsAndExtraTools(t *testing.T) {
 	}
 	if out, code := e.runCLI(t, "doctor"); code != 0 && code != 1 || !strings.Contains(out, "sv") {
 		t.Errorf("doctor: (%d) %q", code, out)
+	}
+}
+
+func completeValues(prog string, words ...string) (string, []string) {
+	d, items := complete(prog, words)
+	vals := []string{}
+	for _, it := range items {
+		vals = append(vals, it.Value)
+	}
+	return d, vals
+}
+
+func TestComplete(t *testing.T) {
+	sv, run := t.TempDir(), t.TempDir()
+	for _, n := range []string{"nginx", "sshd", "dhcpcd"} {
+		os.MkdirAll(filepath.Join(sv, n), 0o755)
+	}
+	os.Symlink(filepath.Join(sv, "nginx"), filepath.Join(run, "nginx"))
+	oldSv, oldRun := SvDir, RunsvDir
+	SvDir, RunsvDir = sv, run
+	defer func() { SvDir, RunsvDir = oldSv, oldRun }()
+	t.Setenv("RUNITCTL_LANG", "de")
+	initI18n("")
+
+	cases := []struct {
+		prog  string
+		words []string
+		dir   string
+		want  []string
+	}{
+		{"runitctl", []string{"st"}, "none", []string{"start", "stop", "status"}},
+		{"runitctl", []string{"mas"}, "none", []string{"mask"}},
+		{"runitctl", []string{"stop", ""}, "none", []string{"nginx"}},
+		{"runitctl", []string{"enable", ""}, "none", []string{"dhcpcd", "nginx", "sshd"}},
+		{"runitctl", []string{"log", "s"}, "none", []string{"sshd"}},
+		{"runitctl", []string{"stop", "nginx", ""}, "none", []string{}},
+		{"runitctl", []string{"log", "nginx", "--"}, "none", []string{"--lines", "--follow", "--interactive", "--grab", "--log-dir", "--lang"}},
+		{"runitctl", []string{"log", "nginx", "-f", "-"}, "none", []string{"--lines", "-n", "--interactive", "-i", "--grab", "-g", "--log-dir", "--lang", "-l"}},
+		{"runitctl", []string{"log", "nginx", "--log-dir", ""}, "dirs", nil},
+		{"runitctl", []string{"log", "nginx", "-n", ""}, "none", []string{}},
+		{"runitctl", []string{"--lang", ""}, "none", []string{"ca", "de", "en", "es", "it", "pt"}},
+		{"runitctl", []string{"--lang=i"}, "none", []string{"--lang=it"}},
+		{"runitctl", []string{"--lang", "de", "sta"}, "none", []string{"start", "status"}},
+		{"runitctl", []string{"completion", ""}, "none", []string{"bash", "zsh", "fish"}},
+		{"runit-journal", []string{"-"}, "none", []string{"-n", "-f", "-g", "--log-dir", "--home", "--version", "-version", "-v", "-V", "--help", "-h"}},
+		{"runit-journal", []string{"s"}, "none", []string{"sshd"}},
+		{"runit-journal", []string{"sshd", ""}, "none", []string{}},
+		{"runit-journal", []string{"-n", "5", ""}, "none", []string{"dhcpcd", "nginx", "sshd"}},
+		{"runit-journal", []string{"--log-dir", ""}, "dirs", nil},
+	}
+	for _, c := range cases {
+		d, got := completeValues(c.prog, c.words...)
+		if d != c.dir {
+			t.Errorf("%v: directiva %q, quería %q", c.words, d, c.dir)
+		}
+		if c.want != nil && !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s %v: %v, quería %v", c.prog, c.words, got, c.want)
+		}
+	}
+	// Las descripciones salen en el idioma activo.
+	_, items := complete("runitctl", []string{"sta"})
+	if len(items) == 0 || items[0].Desc != T("help_start") || !strings.Contains(items[0].Desc, "einschalten") {
+		t.Errorf("descripción no traducida: %+v", items)
+	}
+}
+
+func TestCompletionScriptsAndLangs(t *testing.T) {
+	for _, sh := range completionShells {
+		if !strings.Contains(completionScripts[sh], "__complete") {
+			t.Errorf("script %s incompleto", sh)
+		}
+	}
+	for _, l := range []string{"de", "it"} {
+		t.Setenv("RUNITCTL_LANG", l)
+		if got := detectLang(""); got != l {
+			t.Errorf("detectLang = %q, quería %q", got, l)
+		}
+	}
+	t.Setenv("RUNITCTL_LANG", "")
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	if detectLang("") != "de" {
+		t.Error("LC_ALL=de_DE.UTF-8 debería dar de")
+	}
+}
+
+func TestWrapText(t *testing.T) {
+	got := wrapText("uno dos tres\n  cuatro cinco", 8)
+	want := []string{"uno dos", "tres", "  cuatro", "  cinco"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("wrapText = %q, quería %q", got, want)
+	}
+	for _, l := range wrapText("supercalifragilistico y más", 6) {
+		if len([]rune(l)) > 6 {
+			t.Errorf("línea demasiado larga: %q", l)
+		}
 	}
 }

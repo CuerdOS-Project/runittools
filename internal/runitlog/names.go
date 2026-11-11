@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 // Package runitlog reúne las utilidades compartidas por runitctl y
 // runit-journal: validación de nombres de servicio, lectura de las últimas
 // líneas de un log, decodificación de TAI64N, seguimiento robusto de
@@ -5,6 +14,7 @@
 package runitlog
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -84,4 +94,46 @@ func OpenCapture(service, dir string) (*os.File, error) {
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+// HomeDir devuelve la carpeta personal ($HOME) del usuario actual.
+func HomeDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", fmt.Errorf("no se pudo determinar $HOME")
+	}
+	return home, nil
+}
+
+// SaveSnapshot guarda las líneas dadas en <dir>/<servicio>-<AAAAMMDD-HHMMSS>.log
+// (dir vacío = $HOME) y devuelve la ruta creada. El archivo queda con 0600.
+func SaveSnapshot(service, dir string, lines []string) (string, error) {
+	if dir == "" {
+		home, err := HomeDir()
+		if err != nil {
+			return "", err
+		}
+		dir = home
+	}
+	f, err := OpenCapture(service, dir)
+	if err != nil {
+		return "", err
+	}
+	w := bufio.NewWriter(f)
+	for _, l := range lines {
+		w.WriteString(l)
+		w.WriteByte('\n')
+	}
+	err = w.Flush()
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }

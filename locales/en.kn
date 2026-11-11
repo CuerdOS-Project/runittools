@@ -169,5 +169,16 @@
   "doctor_desc_chpst": "runs something with other permissions and limits",
   "doctor_desc_utmpset": "records open sessions",
   "doctor_desc_svlogtail": "shows the system logs",
-  "doctor_desc_socklog": "receives the system logs"
+  "doctor_desc_socklog": "receives the system logs",
+  "help_completion": "Generate the autocompletion script (bash, zsh, fish)",
+  "comp_flag_lang": "Interface language",
+  "comp_flag_help": "Show help",
+  "comp_flag_lines": "How many previous lines to show",
+  "comp_flag_follow": "Follow new lines live",
+  "comp_flag_interactive": "Interactive screen",
+  "comp_flag_grab": "Save a copy to a file",
+  "comp_flag_logdir": "Folder where the copy is saved",
+  "comp_specify_shell": "Say which shell: bash, zsh or fish.",
+  "comp_unknown_shell": "I don't know the shell '%s'. Use: bash, zsh or fish.",
+  "comp_flag_home": "Save the log to $HOME (.log file)"
 }

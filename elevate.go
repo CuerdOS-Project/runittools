@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -35,14 +44,14 @@ func stdinIsTerminal() bool {
 }
 
 // askYesNo lee una respuesta de r. Una línea vacía devuelve def; acepta
-// s/si/sí/y/yes como sí y cualquier otra cosa como no.
+// s/si/sí/sì/j/ja/y/yes como sí y cualquier otra cosa como no.
 func askYesNo(r io.Reader, w io.Writer, prompt string, def bool) bool {
 	fmt.Fprint(w, prompt)
 	line, _ := bufio.NewReader(r).ReadString('\n')
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "":
 		return def
-	case "s", "si", "sí", "y", "yes", "sim", "oui":
+	case "s", "si", "sí", "y", "yes", "sim", "oui", "sì", "j", "ja":
 		return true
 	}
 	return false
