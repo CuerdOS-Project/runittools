@@ -169,5 +169,16 @@
   "doctor_desc_chpst": "executa algo com outras permissões e limites",
   "doctor_desc_utmpset": "anota as sessões abertas",
   "doctor_desc_svlogtail": "mostra os registros do sistema",
-  "doctor_desc_socklog": "recebe os registros do sistema"
+  "doctor_desc_socklog": "recebe os registros do sistema",
+  "help_completion": "Gerar o script de autocompletar (bash, zsh, fish)",
+  "comp_flag_lang": "Idioma da interface",
+  "comp_flag_help": "Mostrar a ajuda",
+  "comp_flag_lines": "Quantas linhas anteriores mostrar",
+  "comp_flag_follow": "Acompanhar as novas linhas ao vivo",
+  "comp_flag_interactive": "Tela interativa",
+  "comp_flag_grab": "Guardar uma cópia num ficheiro",
+  "comp_flag_logdir": "Pasta onde guardar a cópia",
+  "comp_specify_shell": "Indique a shell: bash, zsh ou fish.",
+  "comp_unknown_shell": "Não conheço a shell '%s'. Use: bash, zsh ou fish.",
+  "comp_flag_home": "Guardar o registo em $HOME (ficheiro .log)"
 }

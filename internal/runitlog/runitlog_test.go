@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package runitlog
 
 import (
@@ -201,5 +210,24 @@ func TestOpenCapture(t *testing.T) {
 	}
 	if d, _ := os.Stat(dir); d.Mode().Perm() != 0o700 {
 		t.Errorf("permisos de carpeta %v, quiero 0700", d.Mode().Perm())
+	}
+}
+
+func TestSaveSnapshotHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path, err := SaveSnapshot("nginx", "", []string{"uno", "dos"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(path) != home || !strings.HasSuffix(path, ".log") || !strings.HasPrefix(filepath.Base(path), "nginx-") {
+		t.Errorf("ruta inesperada: %s", path)
+	}
+	b, _ := os.ReadFile(path)
+	if !strings.Contains(string(b), "uno\ndos\n") {
+		t.Errorf("contenido: %q", b)
+	}
+	if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {
+		t.Errorf("permisos %v", st.Mode().Perm())
 	}
 }

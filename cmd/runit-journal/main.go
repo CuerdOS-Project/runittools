@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -16,7 +25,7 @@ import (
 )
 
 // version se sobrescribe en la compilación: -ldflags "-X main.version=1.2.3".
-var version = "1.0"
+var version = "1.1"
 
 // Mismas variables de entorno que runitctl (ver su documentación).
 var (
@@ -56,6 +65,7 @@ type journalUI struct {
 	paused     bool
 	mu         sync.Mutex
 	capture    *os.File
+	notice     string // mensaje temporal en el pie (p. ej. «Guardado en ...»)
 }
 
 func listServices() []string {
@@ -311,7 +321,11 @@ func (u *journalUI) drawLog(s tcell.Screen) {
 	if empty {
 		draw(s, 1, 2, dim, "Todavía no hay registros; esperando nuevas líneas...")
 	}
-	draw(s, 0, h-1, dim, " ↑/↓/Pg moverse  ←/→ desplazar  f pausar  r recargar  g/G inicio/final  q/Esc volver")
+	if u.notice != "" {
+		draw(s, 0, h-1, tcell.StyleDefault.Foreground(tcell.ColorGreen), " "+u.notice)
+	} else {
+		draw(s, 0, h-1, dim, " ↑/↓/Pg moverse  ←/→ desplazar  f pausar  r recargar  s guardar en $HOME  g/G inicio/final  q/Esc volver")
+	}
 	if w > 0 {
 		s.Show()
 	}
@@ -446,6 +460,7 @@ func (u *journalUI) openLog(s tcell.Screen, service string, follow bool, lines i
 // tomado. Devuelve true si hay que salir del visor.
 func (u *journalUI) handleLogKey(s tcell.Screen, k *tcell.EventKey, src logSource, service string, lines int) bool {
 	{
+		u.notice = ""
 		switch k.Key() {
 		case tcell.KeyEscape:
 			return true
@@ -487,6 +502,8 @@ func (u *journalUI) handleLogKey(s tcell.Screen, k *tcell.EventKey, src logSourc
 				if h, err := loadHistory(src, service, lines); err == nil {
 					u.log = h
 				}
+			case 's':
+				u.saveToHome(service)
 			case 'g':
 				u.offset = 0
 				u.autoScroll = false
@@ -497,6 +514,18 @@ func (u *journalUI) handleLogKey(s tcell.Screen, k *tcell.EventKey, src logSourc
 		}
 	}
 	return false
+}
+
+// saveToHome guarda en $HOME/<servicio>-<fecha>.log el registro cargado en el
+// visor (historial más las líneas recibidas hasta ahora). Debe llamarse con
+// u.mu tomado; deja el resultado en u.notice.
+func (u *journalUI) saveToHome(service string) {
+	path, err := runitlog.SaveSnapshot(service, "", u.log)
+	if err != nil {
+		u.notice = fmt.Sprintf("No se pudo guardar: %v", err)
+		return
+	}
+	u.notice = "Guardado en " + path
 }
 
 func show(s tcell.Screen, msg string) {
@@ -532,6 +561,7 @@ func main() {
 	lines := fs.Int("n", 200, "líneas históricas (1-100000)")
 	grab := fs.Bool("g", false, "guardar el historial y las líneas nuevas en un .log")
 	dir := fs.String("log-dir", "", "carpeta de captura (por defecto $XDG_STATE_HOME/runitctl/logs)")
+	home := fs.Bool("home", false, "guardar el registro en $HOME/<servicio>-<fecha>.log (como -g con --log-dir $HOME)")
 	showVersion := fs.Bool("version", false, "mostrar la versión y salir")
 	fs.BoolVar(showVersion, "v", false, "mostrar la versión y salir")
 	fs.BoolVar(showVersion, "V", false, "mostrar la versión y salir")
@@ -549,6 +579,18 @@ func main() {
 	if *showVersion {
 		fmt.Println("runit-journal " + version)
 		return
+	}
+	if *home {
+		if *dir != "" {
+			fmt.Fprintln(os.Stderr, "--home no se puede usar junto con --log-dir.")
+			os.Exit(2)
+		}
+		h, err := runitlog.HomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		*grab, *dir = true, h
 	}
 	if len(pos) > 1 {
 		fmt.Fprintln(os.Stderr, "Indica un solo servicio.")

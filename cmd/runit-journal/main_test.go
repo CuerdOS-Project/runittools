@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -9,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gdamore/tcell/v2"
 )
 
 func newFS() (*flag.FlagSet, *int, *bool) {
@@ -163,5 +174,21 @@ func TestFollowLoopStopsAndPicksUpRotation(t *testing.T) {
 	defer u.mu.Unlock()
 	if len(u.log) != 1 || strings.HasPrefix(u.log[0], "@") || !strings.HasSuffix(u.log[0], "nuevo") {
 		t.Fatalf("log=%q", u.log)
+	}
+}
+
+func TestSaveKeyWritesToHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	s := tcell.NewSimulationScreen("UTF-8")
+	if err := s.Init(); err != nil {
+		t.Skip(err)
+	}
+	defer s.Fini()
+	u := &journalUI{log: []string{"a", "b"}, service: "nginx"}
+	u.handleLogKey(s, tcell.NewEventKey(tcell.KeyRune, 's', tcell.ModNone), logSource{}, "nginx", 10)
+	files, _ := filepath.Glob(filepath.Join(home, "nginx-*.log"))
+	if len(files) != 1 || !strings.HasPrefix(u.notice, "Guardado en ") {
+		t.Fatalf("archivos=%v aviso=%q", files, u.notice)
 	}
 }

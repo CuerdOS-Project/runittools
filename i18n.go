@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// runitctl - administrador de servicios runit.
+// Este programa es software libre: puedes redistribuirlo o modificarlo bajo
+// los términos de la GNU General Public License publicada por la Free
+// Software Foundation, ya sea la versión 3 o (a tu elección) cualquier
+// versión posterior. Se distribuye sin ninguna garantía; consulta el
+// archivo LICENSE.
+
 package main
 
 import (
@@ -24,13 +33,15 @@ var supportedLangs = map[string]string{
 	"en": "en.kn",
 	"pt": "pt.kn",
 	"ca": "ca.kn",
+	"de": "de.kn",
+	"it": "it.kn",
 }
 
 // detectLang determina el idioma a usar, en este orden de prioridad:
 //  1. Flag --lang=xx o -l xx (procesado externamente y pasado aquí)
 //  2. Variable de entorno RUNITCTL_LANG
 //  3. Variable de entorno LANG / LC_ALL / LC_MESSAGES del sistema
-//  4. Inglés como idioma por defecto (si el sistema está en español, pt o ca
+//  4. Inglés como idioma por defecto (si el sistema está en es, pt, ca, de o it
 //     se detecta solo por las variables de entorno del paso 3)
 func detectLang(explicit string) string {
 	if explicit != "" {

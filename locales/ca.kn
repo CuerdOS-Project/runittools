@@ -169,5 +169,16 @@
   "doctor_desc_chpst": "executa alguna cosa amb altres permisos i límits",
   "doctor_desc_utmpset": "anota les sessions obertes",
   "doctor_desc_svlogtail": "mostra els registres del sistema",
-  "doctor_desc_socklog": "rep els registres del sistema"
+  "doctor_desc_socklog": "rep els registres del sistema",
+  "help_completion": "Generar l'script d'autocompletat (bash, zsh, fish)",
+  "comp_flag_lang": "Idioma de la interfície",
+  "comp_flag_help": "Mostrar l'ajuda",
+  "comp_flag_lines": "Quantes línies anteriors mostrar",
+  "comp_flag_follow": "Seguir les noves línies en directe",
+  "comp_flag_interactive": "Pantalla interactiva",
+  "comp_flag_grab": "Desar una còpia en un fitxer",
+  "comp_flag_logdir": "Carpeta on desar la còpia",
+  "comp_specify_shell": "Indica la shell: bash, zsh o fish.",
+  "comp_unknown_shell": "No conec la shell '%s'. Usa: bash, zsh o fish.",
+  "comp_flag_home": "Desar el registre a $HOME (fitxer .log)"
 }
